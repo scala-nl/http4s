@@ -18,6 +18,7 @@
 package org.http4s
 package parser
 
+import java.lang.reflect.InvocationTargetException
 import java.util
 
 import org.http4s.headers._
@@ -26,27 +27,28 @@ import org.http4s.util.CaseInsensitiveString
 import Header.Parsed
 import org.http4s.syntax.string._
 
-object HttpHeaderParser extends SimpleHeaders
-                    with AcceptHeader
-                    with AcceptLanguageHeader
-                    with CacheControlHeader
-                    with ContentTypeHeader
-                    with CookieHeader
-                    with AcceptCharsetHeader
-                    with AcceptEncodingHeader
-                    with AuthorizationHeader
-                    with RangeParser
-                    with LocationHeader
-                    with RefererHeader
-                    with StrictTransportSecurityHeader
-                    with ProxyAuthenticateHeader
-                    with WwwAuthenticateHeader
-                    with ZipkinHeader {
+object HttpHeaderParser
+    extends SimpleHeaders
+    with AcceptHeader
+    with AcceptLanguageHeader
+    with CacheControlHeader
+    with ContentTypeHeader
+    with CookieHeader
+    with AcceptCharsetHeader
+    with AcceptEncodingHeader
+    with AuthorizationHeader
+    with RangeParser
+    with LocationHeader
+    with RefererHeader
+    with StrictTransportSecurityHeader
+    with ProxyAuthenticateHeader
+    with WwwAuthenticateHeader
+    with ZipkinHeader {
 
   type HeaderParser = String => ParseResult[Parsed]
 
-  private val allParsers = new util.concurrent.ConcurrentHashMap[CaseInsensitiveString, HeaderParser]
-
+  private val allParsers =
+    new util.concurrent.ConcurrentHashMap[CaseInsensitiveString, HeaderParser]
 
   // Constructor
   gatherBuiltIn()
@@ -60,7 +62,6 @@ object HttpHeaderParser extends SimpleHeaders
   def addParser(key: CaseInsensitiveString, parser: HeaderParser): Option[HeaderParser] =
     Option(allParsers.put(key, parser))
 
-
   /** Remove the parser for the specified header key
     *
     * @param key name of the header to be removed
@@ -69,17 +70,26 @@ object HttpHeaderParser extends SimpleHeaders
   def dropParser(key: CaseInsensitiveString): Option[HeaderParser] =
     Option(allParsers.remove(key))
 
-  def parseHeader(header: Header.Raw): ParseResult[Header] = {
+  def parseHeader(header: Header.Raw): ParseResult[Header] =
     allParsers.get(header.name) match {
-      case null => ParseResult.success(header) // if we don't have a rule for the header we leave it unparsed
-      case parser => parser(header.value)
+      case null =>
+        ParseResult.success(header) // if we don't have a rule for the header we leave it unparsed
+      case parser =>
+        try parser(header.value)
+        catch {
+          // We need a way to bail on invalid dates without throwing.  There should be a better way.
+          case e: ParseFailure =>
+            ParseResult.success(header)
+          case e: InvocationTargetException if e.getCause.isInstanceOf[ParseFailure] =>
+            // TODO curse this runtime reflection
+            ParseResult.success(header)
+        }
     }
-  }
 
   /**
-   * Warm up the header parsers by triggering the loading of most classes in this package,
-   * so as to increase the speed of the first usage.
-   */
+    * Warm up the header parsers by triggering the loading of most classes in this package,
+    * so as to increase the speed of the first usage.
+    */
   def warmUp(): Unit = {
     val results = List(
       Header("Accept", "*/*,text/plain,custom/custom"),
@@ -97,21 +107,19 @@ object HttpHeaderParser extends SimpleHeaders
       Header("Host", "http4s.org"),
       Header("X-Forwarded-For", "1.2.3.4"),
       Header("Fancy-Custom-Header", "yeah")
-    ) map parseHeader
+    ).map(parseHeader)
     assert(results.forall(_.isRight))
   }
 
   private def gatherBuiltIn(): Unit =
-    this
-      .getClass
-      .getMethods
+    this.getClass.getMethods
       .filter(_.getName.forall(!_.isLower)) // only the header rules have no lower-case letter in their name
       .foreach { method =>
-      val key = method.getName.replace('_', '-').ci
-      val parser ={ value: String =>
-        method.invoke(this, value)
-      }.asInstanceOf[HeaderParser]
+        val key = method.getName.replace('_', '-').ci
+        val parser = { value: String =>
+          method.invoke(this, value)
+        }.asInstanceOf[HeaderParser]
 
-      addParser(key, parser)
-    }
+        addParser(key, parser)
+      }
 }

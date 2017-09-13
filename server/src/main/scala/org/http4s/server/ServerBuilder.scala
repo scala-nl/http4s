@@ -5,16 +5,17 @@ import java.net.{InetAddress, InetSocketAddress}
 import java.util.concurrent.ExecutorService
 import javax.net.ssl.SSLContext
 
+import cats.effect._
 import fs2._
 import org.http4s.server.SSLKeyStoreSupport.StoreInfo
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration._
 
-trait ServerBuilder {
+trait ServerBuilder[F[_]] {
   import ServerBuilder._
 
-  type Self <: ServerBuilder
+  type Self <: ServerBuilder[F]
 
   def bindSocketAddress(socketAddress: InetSocketAddress): Self
 
@@ -31,27 +32,25 @@ trait ServerBuilder {
 
   def withExecutionContext(executionContext: ExecutionContext): Self
 
-  def mountService(service: HttpService, prefix: String = ""): Self
+  /** Sets the handler for errors thrown invoking the service.  Is not
+    * guaranteed to be invoked on errors on the server backend, such as
+    * parsing a request or handling a context timeout.
+    */
+  def withServiceErrorHandler(serviceErrorHandler: ServiceErrorHandler[F]): Self
+
+  def mountService(service: HttpService[F], prefix: String = ""): Self
 
   /** Returns a task to start a server.  The task completes with a
     * reference to the server when it has started.
     */
-  def start: Task[Server]
-
-  /** Convenience method to run a server.  The method blocks
-    * until the server is started.
-    */
-  final def run: Server =
-    start.unsafeRun
+  def start: F[Server[F]]
 
   /**
-   * Runs the server as a process that never emits.  Useful for a server
-   * that runs for the rest of the JVM's life.
-   */
-  final def serve: Stream[Task, Nothing] =
-    Stream.bracket(start)({s: Server =>
-      Stream.eval_(Task.async[Unit](_ => ())(Strategy.sequential))
-    }, _.shutdown)
+    * Runs the server as a process that never emits.  Useful for a server
+    * that runs for the rest of the JVM's life.
+    */
+  final def serve(implicit F: Async[F]): Stream[F, Nothing] =
+    Stream.bracket(start)((_: Server[F]) => Stream.eval_(F.async[Unit](_ => ())), _.shutdown)
 }
 
 object ServerBuilder {
@@ -62,14 +61,14 @@ object ServerBuilder {
   val DefaultSocketAddress = InetSocketAddress.createUnresolved(DefaultHost, DefaultHttpPort)
 }
 
-trait IdleTimeoutSupport { this: ServerBuilder =>
+trait IdleTimeoutSupport[F[_]] { this: ServerBuilder[F] =>
   def withIdleTimeout(idleTimeout: Duration): Self
 }
 object IdleTimeoutSupport {
   val DefaultIdleTimeout = 30.seconds
 }
 
-trait AsyncTimeoutSupport { this: ServerBuilder =>
+trait AsyncTimeoutSupport[F[_]] { this: ServerBuilder[F] =>
   def withAsyncTimeout(asyncTimeout: Duration): Self
 }
 object AsyncTimeoutSupport {
@@ -78,34 +77,37 @@ object AsyncTimeoutSupport {
 
 sealed trait SSLConfig
 
-final case class KeyStoreBits(keyStore: StoreInfo,
-  keyManagerPassword: String,
-  protocol: String,
-  trustStore: Option[StoreInfo],
-  clientAuth: Boolean) extends SSLConfig
+final case class KeyStoreBits(
+    keyStore: StoreInfo,
+    keyManagerPassword: String,
+    protocol: String,
+    trustStore: Option[StoreInfo],
+    clientAuth: Boolean)
+    extends SSLConfig
 
 final case class SSLContextBits(sslContext: SSLContext, clientAuth: Boolean) extends SSLConfig
 
-trait SSLKeyStoreSupport { this: ServerBuilder =>
-  def withSSL(keyStore: StoreInfo,
-    keyManagerPassword: String,
-              protocol: String = "TLS",
-            trustStore: Option[StoreInfo] = None,
-            clientAuth: Boolean = false): Self
+trait SSLKeyStoreSupport[F[_]] { this: ServerBuilder[F] =>
+  def withSSL(
+      keyStore: StoreInfo,
+      keyManagerPassword: String,
+      protocol: String = "TLS",
+      trustStore: Option[StoreInfo] = None,
+      clientAuth: Boolean = false): Self
 }
 object SSLKeyStoreSupport {
   final case class StoreInfo(path: String, password: String)
 }
 
-trait SSLContextSupport { this: ServerBuilder =>
+trait SSLContextSupport[F[_]] { this: ServerBuilder[F] =>
   def withSSLContext(sslContext: SSLContext, clientAuth: Boolean = false): Self
 }
 
 /*
 trait MetricsSupport { this: ServerBuilder =>
   /**
-   * Triggers collection of backend-specific Metrics into the specified `MetricRegistry`.
-   */
+ * Triggers collection of backend-specific Metrics into the specified `MetricRegistry`.
+ */
   def withMetricRegistry(metricRegistry: MetricRegistry): Self
 
   /** Sets the prefix for metrics gathered by the server.*/
@@ -116,7 +118,7 @@ object MetricsSupport {
 }
  */
 
-trait WebSocketSupport { this: ServerBuilder =>
+trait WebSocketSupport[F[_]] { this: ServerBuilder[F] =>
   /* Enable websocket support */
   def withWebSockets(enableWebsockets: Boolean): Self
 }

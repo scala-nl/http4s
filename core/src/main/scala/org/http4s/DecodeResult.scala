@@ -1,22 +1,22 @@
 package org.http4s
 
+import cats._
 import cats.data._
 import cats.implicits._
-import fs2.Task
 
 object DecodeResult {
-  def apply[A](fa: Task[Either[DecodeFailure, A]]): DecodeResult[A] =
+  def apply[F[_], A](fa: F[Either[DecodeFailure, A]]): DecodeResult[F, A] =
     EitherT(fa)
 
-  def success[A](a: Task[A]): DecodeResult[A] =
+  def success[F[_], A](a: F[A])(implicit F: Functor[F]): DecodeResult[F, A] =
     DecodeResult(a.map(Either.right(_)))
 
-  def success[A](a: A): DecodeResult[A] =
-    success(Task.now(a))
+  def success[F[_], A](a: A)(implicit F: Applicative[F]): DecodeResult[F, A] =
+    success(F.pure(a))
 
-  def failure[A](e: Task[DecodeFailure]): DecodeResult[A] =
+  def failure[F[_], A](e: F[DecodeFailure])(implicit F: Functor[F]): DecodeResult[F, A] =
     DecodeResult(e.map(Either.left(_)))
 
-  def failure[A](e: DecodeFailure): DecodeResult[A] =
-    failure(Task.now(e))
+  def failure[F[_], A](e: DecodeFailure)(implicit F: Applicative[F]): DecodeResult[F, A] =
+    failure(F.pure(e))
 }

@@ -1,9 +1,11 @@
 package org.http4s
 
-import java.net.InetSocketAddress
+import java.net.{InetAddress, InetSocketAddress}
 
+import cats.data.NonEmptyList
+import cats.effect.IO
 import fs2._
-import org.http4s.headers.`Content-Type`
+import org.http4s.headers.{Authorization, `Content-Type`, `X-Forwarded-For`}
 
 class MessageSpec extends Http4sSpec {
 
@@ -13,7 +15,8 @@ class MessageSpec extends Http4sSpec {
       val remote = InetSocketAddress.createUnresolved("www.remote.com", 45444)
 
       "get remote connection info when present" in {
-        val r = Request().withAttribute(Request.Keys.ConnectionInfo(Request.Connection(local, remote, false)))
+        val r = Request().withAttribute(
+          Request.Keys.ConnectionInfo(Request.Connection(local, remote, false)))
         r.server must beSome(local)
         r.remote must beSome(remote)
       }
@@ -25,16 +28,34 @@ class MessageSpec extends Http4sSpec {
       }
 
       "be utilized to determine the address of server and remote" in {
-        val r = Request().withAttribute(Request.Keys.ConnectionInfo(Request.Connection(local, remote, false)))
+        val r = Request().withAttribute(
+          Request.Keys.ConnectionInfo(Request.Connection(local, remote, false)))
         r.serverAddr must_== local.getHostString
         r.remoteAddr must beSome(remote.getHostString)
       }
 
       "be utilized to determine the port of server and remote" in {
-        val r = Request().withAttribute(Request.Keys.ConnectionInfo(Request.Connection(local, remote, false)))
+        val r = Request().withAttribute(
+          Request.Keys.ConnectionInfo(Request.Connection(local, remote, false)))
         r.serverPort must_== local.getPort
         r.remotePort must beSome(remote.getPort)
       }
+
+      "be utilized to determine the from value (first X-Forwarded-For if present)" in {
+        val forwardedValues =
+          NonEmptyList.of(Some(InetAddress.getLocalHost), Some(InetAddress.getLoopbackAddress))
+        val r = Request()
+          .withHeaders(Headers(`X-Forwarded-For`(forwardedValues)))
+          .withAttribute(Request.Keys.ConnectionInfo(Request.Connection(local, remote, false)))
+        r.from must_== forwardedValues.head
+      }
+
+      "be utilized to determine the from value (remote value if X-Forwarded-For is not present)" in {
+        val r = Request()
+          .withAttribute(Request.Keys.ConnectionInfo(Request.Connection(local, remote, false)))
+        r.from must_== Option(remote.getAddress)
+      }
+
     }
 
     /* TODO fs2 spec bring back when unemit comes back
@@ -55,11 +76,19 @@ class MessageSpec extends Http4sSpec {
 
     "support cookies" should {
       "contain a Cookie header when an explicit cookie is added" in {
-        Request(Method.GET).addCookie(Cookie("token", "value")).headers.get("Cookie".ci).map(_.value) must beSome("token=value")
+        Request(Method.GET)
+          .addCookie(Cookie("token", "value"))
+          .headers
+          .get("Cookie".ci)
+          .map(_.value) must beSome("token=value")
       }
 
       "contain a Cookie header when a name/value pair is added" in {
-        Request(Method.GET).addCookie("token", "value").headers.get("Cookie".ci).map(_.value) must beSome("token=value")
+        Request(Method.GET)
+          .addCookie("token", "value")
+          .headers
+          .get("Cookie".ci)
+          .map(_.value) must beSome("token=value")
       }
     }
 
@@ -84,21 +113,44 @@ class MessageSpec extends Http4sSpec {
         originalReq.scriptName mustEqual updatedReq.scriptName
       }
     }
+
+    "toString" should {
+      "redact an Authorization header" in {
+        val request =
+          Request[IO](Method.GET).putHeaders(Authorization(BasicCredentials("user", "pass")))
+        request.toString must_== ("Request(method=GET, uri=/, headers=Headers(Authorization: <REDACTED>))")
+      }
+
+      "redact Cookie Headers" in {
+        val request =
+          Request[IO](Method.GET).addCookie("token", "value").addCookie("token2", "value2")
+        request.toString must_== ("Request(method=GET, uri=/, headers=Headers(Cookie: <REDACTED>, Cookie: <REDACTED>))")
+      }
+    }
   }
 
   "Message" should {
     "decode" >> {
       "produce a UnsupportedMediaType in the event of a decode failure" >> {
         "MediaTypeMismatch" in {
-          val req = Request(headers = Headers(`Content-Type`(MediaType.`application/base64`)))
-          val resp = req.decodeWith(EntityDecoder.text, strict = true)(txt => Task.now(Response()))
+          val req = Request[IO](headers = Headers(`Content-Type`(MediaType.`application/base64`)))
+          val resp = req.decodeWith(EntityDecoder.text, strict = true)(_ => IO.pure(Response()))
           resp.map(_.status) must returnValue(Status.UnsupportedMediaType)
         }
         "MediaTypeMissing" in {
-          val req = Request()
-          val resp = req.decodeWith(EntityDecoder.text, strict = true)(txt => Task.now(Response()))
+          val req = Request[IO]()
+          val resp = req.decodeWith(EntityDecoder.text, strict = true)(_ => IO.pure(Response()))
           resp.map(_.status) must returnValue(Status.UnsupportedMediaType)
         }
+      }
+    }
+  }
+
+  "Response" should {
+    "toString" should {
+      "redact a `Set-Cookie` header" in {
+        val resp = Response().putHeaders(headers.`Set-Cookie`(Cookie("token", "value")))
+        resp.toString must_== ("Response(status=200, headers=Headers(Set-Cookie: <REDACTED>))")
       }
     }
   }

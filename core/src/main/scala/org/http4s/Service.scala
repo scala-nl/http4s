@@ -1,10 +1,9 @@
 package org.http4s
 
 import cats._
-import cats.arrow.Choice
 import cats.data._
+import cats.effect.Sync
 import cats.implicits._
-import fs2._
 
 object Service {
 
@@ -13,34 +12,36 @@ object Service {
     * all requests it is given.  If `f` is a `PartialFunction`, use `apply`
     * instead.
     */
-  def lift[A, B](f: A => Task[B]): Service[A, B] =
+  def lift[F[_], A, B](f: A => F[B]): Service[F, A, B] =
     Kleisli(f)
 
   /** Lifts a partial function to an `Service`.  Responds with the
     * zero of [B] for any request where `pf` is not defined.
     */
-  def apply[A, B: Monoid](pf: PartialFunction[A, Task[B]]): Service[A, B] =
-    lift(req => pf.applyOrElse(req, Function.const(Task.now(Monoid[B].empty))))
+  def apply[F[_], A, B: Monoid](pf: PartialFunction[A, F[B]])(
+      implicit F: Applicative[F]): Service[F, A, B] =
+    lift(req => pf.applyOrElse(req, Function.const(F.pure(Monoid[B].empty))))
 
   /**
-    * Lifts a Task into a [[Service]].
+    * Lifts a F into a [[Service]].
     *
     */
-  def const[A, B](b: Task[B]): Service[A, B] =
+  def const[F[_], A, B](b: F[B]): Service[F, A, B] =
     lift(_ => b)
 
   /**
     *  Lifts a value into a [[Service]].
     *
     */
-  def constVal[A, B](b: => B): Service[A, B] =
-    lift(_ => Task.delay(b))
+  def constVal[F[_], A, B](b: => B)(implicit F: Sync[F]): Service[F, A, B] =
+    lift(_ => F.delay(b))
 
-  /** Allows Service chainig through a `scalaz.Monoid` instance. */
-  def withFallback[A, B](fallback: Service[A, B])(service: Service[A, B])(implicit M: Monoid[Task[B]]): Service[A, B] =
+  /** Allows Service chaining through a Monoid instance. */
+  def withFallback[F[_], A, B](fallback: Service[F, A, B])(service: Service[F, A, B])(
+      implicit M: Semigroup[F[B]]): Service[F, A, B] =
     service |+| fallback
 
   /** A service that always returns the zero of B. */
-  def empty[A, B: Monoid]: Service[A, B] =
+  def empty[F[_]: Sync, A, B: Monoid]: Service[F, A, B] =
     constVal(Monoid[B].empty)
 }

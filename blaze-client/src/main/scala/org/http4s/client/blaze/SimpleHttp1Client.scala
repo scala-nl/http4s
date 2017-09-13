@@ -2,14 +2,19 @@ package org.http4s
 package client
 package blaze
 
+import cats.effect._
+
 /** Create HTTP1 clients which will disconnect on completion of one request */
 object SimpleHttp1Client {
+
   /** create a new simple client
     *
     * @param config blaze configuration object
     */
-  def apply(config: BlazeClientConfig = BlazeClientConfig.defaultConfig): Client = {
-    val manager = ConnectionManager.basic(Http1Support(config))
+  def apply[F[_]: Effect](
+      config: BlazeClientConfig = BlazeClientConfig.defaultConfig): Client[F] = {
+    val manager: ConnectionManager[F, BlazeConnection[F]] =
+      ConnectionManager.basic(Http1Support(config))
     BlazeClient(manager, config, manager.shutdown())
   }
 }

@@ -1,13 +1,13 @@
 package org.http4s
 
-import scala.io.Codec
-
 import cats._
-import cats.data._
+import cats.effect.Sync
 import cats.implicits._
 import org.http4s.headers._
 import org.http4s.parser._
 import org.http4s.util._
+
+import scala.io.Codec
 
 class UrlForm private (val values: Map[String, Seq[String]]) extends AnyVal {
   override def toString: String = values.toString()
@@ -16,7 +16,7 @@ class UrlForm private (val values: Map[String, Seq[String]]) extends AnyVal {
     this.getOrElse(key, Seq.empty[String])
 
   def getOrElse(key: String, default: => Seq[String]): Seq[String] =
-    values.get(key).getOrElse(default)
+    values.getOrElse(key, default)
 
   def getFirst(key: String): Option[String] =
     values.get(key).flatMap(_.headOption)
@@ -44,7 +44,8 @@ class UrlForm private (val values: Map[String, Seq[String]]) extends AnyVal {
     * @param ev evidence of the existence of `QueryParamEncoder[T]`
     * @return `UrlForm` updated as it is updated with `updateFormField(key, v)` if `value` is `Some(v)`, otherwise it is unaltered
     */
-  def updateFormField[T](key: String, value: Option[T])(implicit ev: QueryParamEncoder[T]): UrlForm =
+  def updateFormField[T](key: String, value: Option[T])(
+      implicit ev: QueryParamEncoder[T]): UrlForm =
     value.fold(this)(updateFormField(key, _))
 
   /**
@@ -57,15 +58,15 @@ class UrlForm private (val values: Map[String, Seq[String]]) extends AnyVal {
     vals.foldLeft(this)(_.updateFormField(key, _)(ev))
 
   /* same as `updateFormField(key, value)` */
-  def +?[T : QueryParamEncoder](key: String, value: T): UrlForm =
+  def +?[T: QueryParamEncoder](key: String, value: T): UrlForm =
     updateFormField(key, value)
 
   /* same as `updateParamEncoder`(key, value) */
-  def +?[T : QueryParamEncoder](key: String, value: Option[T]): UrlForm =
+  def +?[T: QueryParamEncoder](key: String, value: Option[T]): UrlForm =
     updateFormField(key, value)
 
   /* same as `updatedParamEncoders`(key, vals) */
-  def ++?[T : QueryParamEncoder](key: String, vals: Seq[T]): UrlForm =
+  def ++?[T: QueryParamEncoder](key: String, vals: Seq[T]): UrlForm =
     updateFormFields(key, vals)
 }
 
@@ -75,7 +76,7 @@ object UrlForm {
 
   def apply(values: Map[String, Seq[String]]): UrlForm =
     // value "" -> Seq() is just noise and it is not maintain during encoding round trip
-    if(values.get("").fold(false)(_.isEmpty)) new UrlForm(values - "")
+    if (values.get("").fold(false)(_.isEmpty)) new UrlForm(values - "")
     else new UrlForm(values)
 
   def apply(values: (String, String)*): UrlForm =
@@ -84,50 +85,64 @@ object UrlForm {
   def fromSeq(values: Seq[(String, String)]): UrlForm =
     apply(values: _*)
 
-  implicit def entityEncoder(implicit charset: Charset = DefaultCharset): EntityEncoder[UrlForm] =
-    EntityEncoder.stringEncoder(charset)
+  implicit def entityEncoder[F[_]](
+      implicit F: Applicative[F],
+      charset: Charset = DefaultCharset): EntityEncoder[F, UrlForm] =
+    EntityEncoder
+      .stringEncoder[F]
       .contramap[UrlForm](encodeString(charset))
       .withContentType(`Content-Type`(MediaType.`application/x-www-form-urlencoded`, charset))
 
-  implicit def entityDecoder(implicit defaultCharset: Charset = DefaultCharset): EntityDecoder[UrlForm] =
-    EntityDecoder.decodeBy(MediaType.`application/x-www-form-urlencoded`){ m =>
+  implicit def entityDecoder[F[_]](
+      implicit F: Sync[F],
+      defaultCharset: Charset = DefaultCharset): EntityDecoder[F, UrlForm] =
+    EntityDecoder.decodeBy(MediaType.`application/x-www-form-urlencoded`) { m =>
       DecodeResult(
-        EntityDecoder.decodeString(m)
+        EntityDecoder
+          .decodeString(m)
           .map(decodeString(m.charset.getOrElse(defaultCharset)))
       )
     }
 
-  implicit val eqInstance: Eq[UrlForm] = new Eq[UrlForm] {
-    def eqv(x: UrlForm, y: UrlForm): Boolean =
-      x.values.mapValues(_.toList).view.force === y.values.mapValues(_.toList).view.force
+  implicit val eqInstance: Eq[UrlForm] = Eq.instance { (x: UrlForm, y: UrlForm) =>
+    x.values.mapValues(_.toList).view.force === y.values.mapValues(_.toList).view.force
   }
 
   /** Attempt to decode the `String` to a [[UrlForm]] */
-  def decodeString(charset: Charset)(urlForm: String): Either[MalformedMessageBodyFailure, UrlForm] =
-    QueryParser.parseQueryString(urlForm.replace("+", "%20"), new Codec(charset.nioCharset))
+  def decodeString(charset: Charset)(
+      urlForm: String): Either[MalformedMessageBodyFailure, UrlForm] =
+    QueryParser
+      .parseQueryString(urlForm.replace("+", "%20"), new Codec(charset.nioCharset))
       .map(q => UrlForm(q.multiParams))
-      .leftMap { parseFailure => MalformedMessageBodyFailure(parseFailure.message, None) }
+      .leftMap { parseFailure =>
+        MalformedMessageBodyFailure(parseFailure.message, None)
+      }
 
   /** Encode the [[UrlForm]] into a `String` using the provided `Charset` */
   def encodeString(charset: Charset)(urlForm: UrlForm): String = {
     def encode(s: String): String =
-      UrlCodingUtils.urlEncode(s, charset.nioCharset, spaceIsPlus = true, toSkip = UrlCodingUtils.Unreserved)
+      UrlCodingUtils.urlEncode(
+        s,
+        charset.nioCharset,
+        spaceIsPlus = true,
+        toSkip = UrlCodingUtils.Unreserved)
 
     val sb = new StringBuilder(urlForm.values.size * 20)
-    urlForm.values.foreach { case (k, vs) =>
-      if (sb.nonEmpty) sb.append('&')
-      val encodedKey = encode(k)
-      if (vs.isEmpty) sb.append(encodedKey)
-      else {
-        var first = true
-        vs.foreach { v =>
-          if(!first) sb.append('&')
-          else first = false
-          sb.append(encodedKey)
-            .append('=')
-            .append(encode(v))
+    urlForm.values.foreach {
+      case (k, vs) =>
+        if (sb.nonEmpty) sb.append('&')
+        val encodedKey = encode(k)
+        if (vs.isEmpty) sb.append(encodedKey)
+        else {
+          var first = true
+          vs.foreach { v =>
+            if (!first) sb.append('&')
+            else first = false
+            sb.append(encodedKey)
+              .append('=')
+              .append(encode(v))
+          }
         }
-      }
     }
     sb.result()
   }

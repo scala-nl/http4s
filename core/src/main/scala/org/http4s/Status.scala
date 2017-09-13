@@ -16,7 +16,11 @@ import org.http4s.util.Renderable
   * @see [http://tools.ietf.org/html/rfc7231#section-6 RFC7231, Section 6]
   * @see [http://www.iana.org/assignments/http-status-codes/http-status-codes.xhtml IANA Status Code Registry]
   */
-final case class Status private (code: Int)(val reason: String = "", val isEntityAllowed: Boolean = true) extends Ordered[Status] with Renderable {
+final case class Status private (code: Int)(
+    val reason: String = "",
+    val isEntityAllowed: Boolean = true)
+    extends Ordered[Status]
+    with Renderable {
   // scalastyle:off magic.number
   val responseClass: ResponseClass =
     if (code < 200) Status.Informational
@@ -32,12 +36,11 @@ final case class Status private (code: Int)(val reason: String = "", val isEntit
 
   def withReason(reason: String): Status = new Status(code)(reason, isEntityAllowed)
 
-  override def render(writer: org.http4s.util.Writer): writer.type =  writer << code << ' ' << reason
+  override def render(writer: org.http4s.util.Writer): writer.type = writer << code << ' ' << reason
 
   /** Helpers for for matching against a [[Response]] */
-  def unapply(msg: Response): Option[Response] = {
+  def unapply[F[_]](msg: Response[F]): Option[Response[F]] =
     if (msg.status == this) Some(msg) else None
-  }
 }
 
 object Status {
@@ -45,8 +48,11 @@ object Status {
     def isSuccess: Boolean
 
     /** Match a [[Response]] based on [[Status]] category */
-    final def unapply(resp: Response): Option[Response] =
-      if (resp.status.responseClass == this) Some(resp) else None
+    final def unapply[F[_]](resp: MaybeResponse[F]): Option[Response[F]] =
+      resp match {
+        case resp @ Response(status, _, _, _, _) if status.responseClass == this => Some(resp)
+        case _ => None
+      }
   }
 
   case object Informational extends ResponseClass { val isSuccess = true }
@@ -69,7 +75,8 @@ object Status {
   }
 
   private def mkStatus(code: Int, reason: String = ""): ParseResult[Status] =
-    if (code >= 100 && code <= 599) ParseResult.success(Status(code)(reason, isEntityAllowed = true))
+    if (code >= 100 && code <= 599)
+      ParseResult.success(Status(code)(reason, isEntityAllowed = true))
     else ParseResult.fail("Invalid status", s"Code $code must be between 100 and 599, inclusive")
 
   private def lookup(code: Int) =
@@ -85,20 +92,20 @@ object Status {
     new AtomicReferenceArray[Right[Nothing, Status]](600)
   // scalastyle:on magic.number
 
-  def registered: Iterable[Status] = for {
-    code <- 100 to 599
-    status <- Option(registry.get(code)).map(_.right.get)
-  } yield status
+  def registered: Iterable[Status] =
+    for {
+      code <- 100 to 599
+      status <- Option(registry.get(code)).map(_.right.get)
+    } yield status
 
   def register(status: Status): status.type = {
-    // Xor.Right, not right, for specific inference
     registry.set(status.code, Right(status))
     status
   }
 
   /**
-   * Status code list taken from http://www.iana.org/assignments/http-status-codes/http-status-codes.xml
-   */
+    * Status code list taken from http://www.iana.org/assignments/http-status-codes/http-status-codes.xml
+    */
   // scalastyle:off magic.number
   val Continue = register(Status(100)("Continue", isEntityAllowed = false))
   val SwitchingProtocols = register(Status(101)("Switching Protocols", isEntityAllowed = false))

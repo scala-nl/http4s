@@ -5,17 +5,16 @@ import cats.implicits._
 import org.http4s.HeaderKey.StringKey
 import org.http4s.util.CaseInsensitiveString
 import org.http4s.headers.`Set-Cookie`
+import org.http4s.syntax.string._
 
 import scala.collection.{GenTraversableOnce, immutable, mutable}
 import scala.collection.generic.CanBuildFrom
 import scala.collection.mutable.ListBuffer
 
-
 /** A collection of HTTP Headers */
 final class Headers private (headers: List[Header])
-  extends immutable.Iterable[Header]
-  with collection.IterableLike[Header, Headers]
-{
+    extends immutable.Iterable[Header]
+    with collection.IterableLike[Header, Headers] {
 
   override def toList: List[Header] = headers
 
@@ -39,6 +38,13 @@ final class Headers private (headers: List[Header])
     */
   def get(key: HeaderKey.Extractable): Option[key.HeaderT] = key.from(this)
 
+  @deprecated(
+    "Use response.cookies instead. Set-Cookie is unique among HTTP headers in that it can be repeated but can't be joined by a ','. This will return only the first Set-Cookie header. `response.cookies` will return the complete list.",
+    "0.16.0-RC1"
+  )
+  def get(key: `Set-Cookie`.type): Option[`Set-Cookie`] =
+    key.from(this).headOption
+
   /** Attempt to get a [[org.http4s.Header]] from this collection of headers
     *
     * @param key name of the header to find
@@ -52,11 +58,10 @@ final class Headers private (headers: List[Header])
     * @param in multiple [[Header]] to append to the new collection
     * @return a new [[Headers]] containing the sum of the initial and input headers
     */
-  def put(in: Header*): Headers = {
+  def put(in: Header*): Headers =
     if (in.isEmpty) this
     else if (this.isEmpty) new Headers(in.toList)
     else this ++ in
-  }
 
   /** Concatenate the two collections
     * If the resulting collection is of Headers type, duplicate Singleton headers will be removed from
@@ -66,29 +71,29 @@ final class Headers private (headers: List[Header])
     * @tparam B type contained in collection `that`
     * @tparam That resulting type of the new collection
     */
-  override def ++[B >: Header, That](that: GenTraversableOnce[B])(implicit bf: CanBuildFrom[Headers, B, That]): That = {
-    if (bf eq Headers.canBuildFrom) {   // Making a new Headers collection from a collection of Header's
+  override def ++[B >: Header, That](that: GenTraversableOnce[B])(
+      implicit bf: CanBuildFrom[Headers, B, That]): That =
+    if (bf eq Headers.canBuildFrom) { // Making a new Headers collection from a collection of Header's
       if (that.isEmpty) this.asInstanceOf[That]
       else if (this.isEmpty) that match {
         case hs: Headers => hs.asInstanceOf[That]
         case hs => new Headers(hs.toList.asInstanceOf[List[Header]]).asInstanceOf[That]
-      }
-      else {
+      } else {
         val hs = that.toList.asInstanceOf[List[Header]]
         val acc = new ListBuffer[Header]
-        this.headers.foreach { orig => orig.parsed match {
-          case h: Header.Recurring                 => acc += orig
-          case h: `Set-Cookie`                     => acc += orig
-          case h if !hs.exists(_.name == h.name)   => acc += orig
-          case _                                   => // NOOP, drop non recurring header that already exists
-        }}
+        this.headers.foreach { orig =>
+          orig.parsed match {
+            case h: Header.Recurring => acc += orig
+            case h: `Set-Cookie` => acc += orig
+            case h if !hs.exists(_.name == h.name) => acc += orig
+            case _ => // NOOP, drop non recurring header that already exists
+          }
+        }
 
-        val h =  new Headers(acc.prependToList(hs))
+        val h = new Headers(acc.prependToList(hs))
         h.asInstanceOf[That]
       }
-    }
-    else super.++(that)
-  }
+    } else super.++(that)
 
   override def hashCode(): Int = this.headers.hashCode()
 
@@ -97,6 +102,21 @@ final class Headers private (headers: List[Header])
       this.toList.equals(otherheaders.toList)
     case _ => false
   }
+
+  /** Removes the `Content-Length`, `Content-Range`, `Trailer`, and
+    * `Transfer-Encoding` headers.
+    *
+    *  https://tools.ietf.org/html/rfc7231#section-3.3
+    */
+  def removePayloadHeaders: Headers =
+    filterNot(h => Headers.PayloadHeaderKeys(h.name))
+
+  def redactSensitive(
+      redactWhen: CaseInsensitiveString => Boolean = Headers.SensitiveHeaders.contains): Headers =
+    headers.map {
+      case h if redactWhen(h.name) => Header.Raw(h.name, "<REDACTED>")
+      case h => h
+    }
 }
 
 object Headers {
@@ -116,13 +136,25 @@ object Headers {
     }
 
   private def newBuilder: mutable.Builder[Header, Headers] =
-    new mutable.ListBuffer[Header] mapResult (b => new Headers(b))
+    new mutable.ListBuffer[Header].mapResult(b => new Headers(b))
 
   implicit val headersShow: Show[Headers] =
-    Show.show[Headers]{
+    Show.show[Headers] {
       _.iterator.map(_.show).mkString("Headers(", ", ", ")")
     }
 
-  implicit val HeadersEq : Eq[Headers] = Eq.by(_.toList)
+  implicit val HeadersEq: Eq[Headers] = Eq.by(_.toList)
 
+  private val PayloadHeaderKeys = Set(
+    "Content-Length".ci,
+    "Content-Range".ci,
+    "Trailer".ci,
+    "Transfer-Encoding".ci
+  )
+
+  val SensitiveHeaders = Set(
+    "Authorization".ci,
+    "Cookie".ci,
+    "Set-Cookie".ci
+  )
 }

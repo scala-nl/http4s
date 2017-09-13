@@ -4,32 +4,39 @@ import java.nio.ByteBuffer
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicReference
 
+import org.http4s.blaze.pipeline.Command.{Disconnect, EOF, Error, OutboundCommand}
+import org.http4s.blaze.pipeline.MidStage
+import org.http4s.blaze.util.{Cancellable, TickWheelExecutor}
+
 import scala.annotation.tailrec
-import scala.concurrent.{Promise, Future}
 import scala.concurrent.duration.Duration
+import scala.concurrent.{Future, Promise}
 import scala.util.{Failure, Success}
 
-import org.http4s.blaze.pipeline.MidStage
-import org.http4s.blaze.pipeline.Command.{Error, OutboundCommand, EOF, Disconnect}
-import org.http4s.blaze.util.{ Cancellable, TickWheelExecutor }
+final private[blaze] class ClientTimeoutStage(
+    responseHeaderTimeout: Duration,
+    idleTimeout: Duration,
+    requestTimeout: Duration,
+    exec: TickWheelExecutor)
+    extends MidStage[ByteBuffer, ByteBuffer] { stage =>
 
-
-final private class ClientTimeoutStage(idleTimeout: Duration, requestTimeout: Duration, exec: TickWheelExecutor)
-  extends MidStage[ByteBuffer, ByteBuffer]
-{ stage =>
-
-  import ClientTimeoutStage.Closed
+  import ClientTimeoutStage._
 
   private implicit val ec = org.http4s.blaze.util.Execution.directec
 
-  // The 'per request' timeout. Lasts the lifetime of the stage.
-  private val activeReqTimeout = new AtomicReference[ Cancellable](null)
+  // The timeout between request body completion and response header
+  // completion.
+  private val activeResponseHeaderTimeout = new AtomicReference[Cancellable](null)
+
+  // The total timeout for the request. Lasts the lifetime of the stage.
+  private val activeReqTimeout = new AtomicReference[Cancellable](null)
 
   // The timeoutState contains a Cancellable, null, or a TimeoutException
   // It will also act as the point of synchronization
   private val timeoutState = new AtomicReference[AnyRef](null)
 
-  override def name: String = s"ClientTimeoutStage: Idle: $idleTimeout, Request: $requestTimeout"
+  override def name: String =
+    s"ClientTimeoutStage: Response Header: $responseHeaderTimeout, Idle: $idleTimeout, Request: $requestTimeout"
 
   /////////// Private impl bits //////////////////////////////////////////
   private def killswitch(name: String, timeout: Duration) = new Runnable {
@@ -43,12 +50,15 @@ final private class ClientTimeoutStage(idleTimeout: Duration, requestTimeout: Du
         case _: TimeoutException => // Interesting that we got here.
       }
 
+      cancelResponseHeaderTimeout()
+
       // Cancel the active request timeout if it exists
       activeReqTimeout.getAndSet(Closed) match {
-        case null    => /* We beat the startup. Maybe timeout is 0? */
+        case null =>
+          /* We beat the startup. Maybe timeout is 0? */
           sendOutboundCommand(Disconnect)
 
-        case Closed  => /* Already closed, no need to disconnect */
+        case Closed => /* Already closed, no need to disconnect */
 
         case timeout =>
           timeout.cancel()
@@ -57,6 +67,7 @@ final private class ClientTimeoutStage(idleTimeout: Duration, requestTimeout: Du
     }
   }
 
+  private val responseHeaderTimeoutKillswitch = killswitch("response header", responseHeaderTimeout)
   private val idleTimeoutKillswitch = killswitch("idle", idleTimeout)
   private val requestTimeoutKillswitch = killswitch("request", requestTimeout)
 
@@ -80,6 +91,12 @@ final private class ClientTimeoutStage(idleTimeout: Duration, requestTimeout: Du
     case Error(t: TimeoutException) if t eq timeoutState.get() =>
       sendOutboundCommand(Disconnect)
 
+    case RequestSendComplete =>
+      activateResponseHeaderTimeout()
+
+    case ResponseHeaderComplete =>
+      cancelResponseHeaderTimeout()
+
     case cmd => super.outboundCommand(cmd)
   }
 
@@ -88,7 +105,7 @@ final private class ClientTimeoutStage(idleTimeout: Duration, requestTimeout: Du
   override protected def stageShutdown(): Unit = {
     cancelTimeout()
     activeReqTimeout.getAndSet(Closed) match {
-      case null    => logger.error("Shouldn't get here.")
+      case null => logger.error("Shouldn't get here.")
       case timeout => timeout.cancel()
     }
     super.stageShutdown()
@@ -100,10 +117,9 @@ final private class ClientTimeoutStage(idleTimeout: Duration, requestTimeout: Du
     if (!activeReqTimeout.compareAndSet(null, timeout)) {
       activeReqTimeout.get() match {
         case Closed => // NOOP: the timeout already triggered
-        case _      => logger.error("Shouldn't get here.")
+        case _ => logger.error("Shouldn't get here.")
       }
-    }
-    else resetTimeout()
+    } else resetTimeout()
   }
 
   /////////// Private stuff ////////////////////////////////////////////////
@@ -112,20 +128,21 @@ final private class ClientTimeoutStage(idleTimeout: Duration, requestTimeout: Du
     val p = Promise[T]
 
     f.onComplete {
-      case s@ Success(_) =>
+      case s @ Success(_) =>
         resetTimeout()
         p.tryComplete(s)
 
-      case eof@ Failure(EOF) => timeoutState.get() match {
-        case t: TimeoutException => p.tryFailure(t)
-        case c: Cancellable =>
-          c.cancel()
-          p.tryComplete(eof)
+      case eof @ Failure(EOF) =>
+        timeoutState.get() match {
+          case t: TimeoutException => p.tryFailure(t)
+          case c: Cancellable =>
+            c.cancel()
+            p.tryComplete(eof)
 
-        case null => p.tryComplete(eof)
-      }
+          case null => p.tryComplete(eof)
+        }
 
-      case v@ Failure(_) => p.complete(v)
+      case v @ Failure(_) => p.complete(v)
     }
 
     p.future
@@ -146,16 +163,34 @@ final private class ClientTimeoutStage(idleTimeout: Duration, requestTimeout: Du
     }; go()
   }
 
-  private def resetTimeout(): Unit = {
+  private def resetTimeout(): Unit =
     setAndCancel(exec.schedule(idleTimeoutKillswitch, idleTimeout))
-  }
 
   private def cancelTimeout(): Unit = setAndCancel(null)
+
+  private def activateResponseHeaderTimeout(): Unit = {
+    val timeout = exec.schedule(responseHeaderTimeoutKillswitch, ec, responseHeaderTimeout)
+    if (!activeResponseHeaderTimeout.compareAndSet(null, timeout))
+      timeout.cancel()
+  }
+
+  private def cancelResponseHeaderTimeout(): Unit =
+    activeResponseHeaderTimeout.getAndSet(Closed) match {
+      case null => // no-op
+      case timeout => timeout.cancel()
+    }
 }
 
-private object ClientTimeoutStage {
+private[blaze] object ClientTimeoutStage {
+  // Sent when we have sent the complete request
+  private[blaze] object RequestSendComplete extends OutboundCommand
+
+  // Sent when we have received the complete response
+  private[blaze] object ResponseHeaderComplete extends OutboundCommand
+
   // Make sure we have our own _stable_ copy for synchronization purposes
   private val Closed = new Cancellable {
     def cancel() = ()
+    override def toString = "Closed"
   }
 }

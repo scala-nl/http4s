@@ -11,19 +11,20 @@ import scala.concurrent.Future
   * requests against a stale connection when doing so may result in side
   * effects, and therefore cannot be retried.
   */
-private final class ReadBufferStage[T] extends MidStage[T, T] {
+private[blaze] final class ReadBufferStage[T] extends MidStage[T, T] {
 
   override def name: String = "ReadBufferingStage"
 
   private val lock: Object = this
-  private var buffered: Future[T] = null
+  private var buffered: Future[T] = _
 
   override def writeRequest(data: T): Future[Unit] = channelWrite(data)
 
   override def writeRequest(data: Seq[T]): Future[Unit] = channelWrite(data)
 
   override def readRequest(size: Int): Future[T] = lock.synchronized {
-    if (buffered == null) Future.failed(new IllegalStateException("Cannot have multiple pending reads"))
+    if (buffered == null)
+      Future.failed(new IllegalStateException("Cannot have multiple pending reads"))
     else if (buffered.isCompleted) {
       // What luck: we can schedule a new read right now, without an intermediate future
       val r = buffered
@@ -36,7 +37,9 @@ private final class ReadBufferStage[T] extends MidStage[T, T] {
 
       // We use map as it will introduce some ordering: scheduleRead() will
       // be called before the new Future resolves, triggering the next read.
-      r.map { v => scheduleRead(); v }(Execution.directec)
+      r.map { v =>
+        scheduleRead(); v
+      }(Execution.directec)
     }
   }
 
@@ -60,5 +63,3 @@ private final class ReadBufferStage[T] extends MidStage[T, T] {
     }
   }
 }
-
-

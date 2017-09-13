@@ -2,7 +2,9 @@ package org.http4s
 package server
 package staticcontent
 
-import fs2.Task
+import cats._
+import cats.effect._
+import cats.implicits._
 
 /**
   * Constructs new services to serve assets from Webjars
@@ -14,8 +16,9 @@ object WebjarService {
     * @param filter To filter which assets from the webjars should be served
     * @param cacheStrategy strategy to use for caching purposes. Default to no caching.
     */
-  final case class Config(filter: WebjarAssetFilter = _ => true,
-                          cacheStrategy: CacheStrategy = NoopCacheStrategy)
+  final case class Config[F[_]](
+      filter: WebjarAssetFilter = _ => true,
+      cacheStrategy: CacheStrategy[F] = NoopCacheStrategy[F])
 
   /**
     * Contains the information about an asset inside a webjar
@@ -49,15 +52,15 @@ object WebjarService {
     * @param config The configuration for this service
     * @return The HttpService
     */
-  def apply(config: Config): HttpService = Service {
+  def apply[F[_]: Monad: Sync](config: Config[F]): HttpService[F] = Service {
     // Intercepts the routes that match webjar asset names
     case request if request.method == Method.GET =>
       Option(request.pathInfo)
-          .map(sanitize)
-          .flatMap(toWebjarAsset)
-          .filter(config.filter)
-          .map(serveWebjarAsset(config, request))
-          .getOrElse(Pass.now)
+        .map(sanitize)
+        .flatMap(toWebjarAsset)
+        .filter(config.filter)
+        .map(serveWebjarAsset(config, request))
+        .getOrElse(Pass.pure[F])
   }
 
   /**
@@ -67,7 +70,7 @@ object WebjarService {
     * @return The path, ending with a slash
     */
   private def ensureSlash(path: String): String =
-    if(path.nonEmpty && !path.endsWith("/"))
+    if (path.nonEmpty && !path.endsWith("/"))
       path + "/"
     else
       path
@@ -95,8 +98,10 @@ object WebjarService {
     * @param request The Request
     * @return Either the the Asset, if it exist, or Pass
     */
-  private def serveWebjarAsset(config: Config, request: Request)(webjarAsset: WebjarAsset): Task[MaybeResponse] =
+  private def serveWebjarAsset[F[_]: Sync](config: Config[F], request: Request[F])(
+      webjarAsset: WebjarAsset): F[MaybeResponse[F]] =
     StaticFile
       .fromResource(webjarAsset.pathInJar, Some(request))
-      .fold(Pass.now)(config.cacheStrategy.cache(request.pathInfo, _))
+      .fold(Pass.pure[F])(config.cacheStrategy.cache(request.pathInfo, _).widen[MaybeResponse[F]])
+      .flatten
 }

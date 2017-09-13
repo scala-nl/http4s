@@ -4,14 +4,15 @@ package metrics
 
 import java.util.concurrent.TimeUnit
 
+import cats.effect._
 import cats.implicits._
-import fs2.util.Attempt
-import fs2.{Stream, Task}
+import fs2._
 import com.codahale.metrics.MetricRegistry
 
 object Metrics {
 
-  def apply(m: MetricRegistry, prefix: String = "org.http4s.server"): HttpMiddleware = { service =>
+  def apply[F[_]](m: MetricRegistry, prefix: String = "org.http4s.server")(
+      implicit F: Effect[F]): HttpMiddleware[F] = { service =>
     val active_requests = m.counter(s"${prefix}.active-requests")
 
     val abnormal_termination = m.timer(s"${prefix}.abnormal-termination")
@@ -39,55 +40,60 @@ object Metrics {
 
     def generalMetrics(method: Method, elapsed: Long): Unit = {
       method match {
-        case Method.GET     => get_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.POST    => post_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.PUT     => put_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.HEAD    => head_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.MOVE    => move_req.update(elapsed, TimeUnit.NANOSECONDS)
+        case Method.GET => get_req.update(elapsed, TimeUnit.NANOSECONDS)
+        case Method.POST => post_req.update(elapsed, TimeUnit.NANOSECONDS)
+        case Method.PUT => put_req.update(elapsed, TimeUnit.NANOSECONDS)
+        case Method.HEAD => head_req.update(elapsed, TimeUnit.NANOSECONDS)
+        case Method.MOVE => move_req.update(elapsed, TimeUnit.NANOSECONDS)
         case Method.OPTIONS => options_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.TRACE   => trace_req.update(elapsed, TimeUnit.NANOSECONDS)
+        case Method.TRACE => trace_req.update(elapsed, TimeUnit.NANOSECONDS)
         case Method.CONNECT => connect_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.DELETE  => delete_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case _              => other_req.update(elapsed, TimeUnit.NANOSECONDS)
+        case Method.DELETE => delete_req.update(elapsed, TimeUnit.NANOSECONDS)
+        case _ => other_req.update(elapsed, TimeUnit.NANOSECONDS)
       }
 
       total_req.update(elapsed, TimeUnit.NANOSECONDS)
       active_requests.dec()
     }
 
-    def onFinish(method: Method, start: Long)(r: Attempt[MaybeResponse]): Attempt[MaybeResponse] = {
+    def onFinish(method: Method, start: Long)(
+        r: Either[Throwable, MaybeResponse[F]]): Either[Throwable, MaybeResponse[F]] = {
       val elapsed = System.nanoTime() - start
 
       r.map { r =>
-        headers_times.update(System.nanoTime() - start, TimeUnit.NANOSECONDS)
-        val code = r.cata(_.status, Status.NotFound).code
+          headers_times.update(System.nanoTime() - start, TimeUnit.NANOSECONDS)
+          val code = r.cata(_.status, Status.NotFound).code
 
-        def capture(r: Response) = r.body.onFinalize[Task] {
-          Task.delay {
-            generalMetrics(method, elapsed)
-            if (code < 200) resp1xx.update(elapsed, TimeUnit.NANOSECONDS)
-            else if (code < 300) resp2xx.update(elapsed, TimeUnit.NANOSECONDS)
-            else if (code < 400) resp3xx.update(elapsed, TimeUnit.NANOSECONDS)
-            else if (code < 500) resp4xx.update(elapsed, TimeUnit.NANOSECONDS)
-            else resp5xx.update(elapsed, TimeUnit.NANOSECONDS)
-          }
-        }.onError { cause =>
-          abnormal_termination.update(elapsed, TimeUnit.NANOSECONDS)
-          Stream.fail(cause)
+          def capture(r: Response[F]) =
+            r.body
+              .onFinalize {
+                F.delay {
+                  generalMetrics(method, elapsed)
+                  if (code < 200) resp1xx.update(elapsed, TimeUnit.NANOSECONDS)
+                  else if (code < 300) resp2xx.update(elapsed, TimeUnit.NANOSECONDS)
+                  else if (code < 400) resp3xx.update(elapsed, TimeUnit.NANOSECONDS)
+                  else if (code < 500) resp4xx.update(elapsed, TimeUnit.NANOSECONDS)
+                  else resp5xx.update(elapsed, TimeUnit.NANOSECONDS)
+                }
+              }
+              .onError { cause =>
+                abnormal_termination.update(elapsed, TimeUnit.NANOSECONDS)
+                Stream.fail(cause)
+              }
+          r
         }
-        r
-      }.leftMap { e =>
-        generalMetrics(method, elapsed)
-        resp5xx.update(elapsed, TimeUnit.NANOSECONDS)
-        service_failure.update(elapsed, TimeUnit.NANOSECONDS)
-        e
-      }
+        .leftMap { e =>
+          generalMetrics(method, elapsed)
+          resp5xx.update(elapsed, TimeUnit.NANOSECONDS)
+          service_failure.update(elapsed, TimeUnit.NANOSECONDS)
+          e
+        }
     }
 
-    Service.lift { req: Request =>
+    Service.lift { req: Request[F] =>
       val now = System.nanoTime()
       active_requests.inc()
-      service(req).attempt.flatMap(onFinish(req.method, now)(_).fold(Task.fail, Task.now))
+      service(req).attempt.flatMap(onFinish(req.method, now)(_).fold(F.raiseError, F.pure))
     }
   }
 }
